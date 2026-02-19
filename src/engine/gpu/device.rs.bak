@@ -1,0 +1,66 @@
+//! GPU Device Initialization (Async - WASM Compatible)
+
+use log::{error, info};
+use wgpu::{Adapter, Device, Instance, Queue, Surface};
+
+pub struct GpuDevice {
+    pub device: Device,
+    pub queue: Queue,
+    pub adapter: Adapter,
+}
+
+impl GpuDevice {
+    pub async fn new(instance: &Instance, surface: &Surface<'_>) -> GpuDevice {
+        info!("========================================");
+        info!("🚀 [GPU] Initializing WebGPU Device");
+        info!("========================================");
+
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                compatible_surface: Some(surface),
+                force_fallback_adapter: false,
+            })
+            .await
+            .expect("No compatible GPU adapter found");
+
+        Self::log_adapter_info(&adapter);
+
+        let (device, queue) = adapter
+            .request_device(
+                &wgpu::DeviceDescriptor {
+                    label: Some("ATLAS Device"),
+                    required_features: wgpu::Features::empty(),
+                    required_limits: wgpu::Limits::default(),
+                    memory_hints: wgpu::MemoryHints::default(),
+                    trace: wgpu::Trace::Off,
+                    experimental_features: wgpu::ExperimentalFeatures::disabled(),
+                },
+            )
+            .await
+            .unwrap_or_else(|e| {
+                error!("❌ Device creation failed: {:?}", e);
+                panic!("Failed to create GPU device: {:?}", e);
+            });
+
+        info!("✅ GPU Device successfully created.");
+
+        GpuDevice {
+            device,
+            queue,
+            adapter,
+        }
+    }
+
+    fn log_adapter_info(adapter: &Adapter) {
+        let info_struct = adapter.get_info();
+
+        info!("----------------------------------------");
+        info!("🖥 Adapter Information");
+        info!("----------------------------------------");
+        info!("Name      : {}", info_struct.name);
+        info!("Backend   : {:?}", info_struct.backend);
+        info!("----------------------------------------");
+    }
+}
+

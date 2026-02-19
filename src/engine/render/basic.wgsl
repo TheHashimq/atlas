@@ -1,0 +1,296 @@
+const PI         : f32 = 3.14159265358979;
+const MAX_LIGHTS : u32 = 4u;
+
+struct SceneUniforms {
+    view_proj        : mat4x4<f32>,
+    light_view_proj  : mat4x4<f32>,
+    camera_pos       : vec4<f32>,
+    time             : vec4<f32>,
+    light_pos        : array<vec4<f32>, 4>,
+    light_color      : array<vec4<f32>, 4>,
+};
+
+struct Material {
+    albedo    : vec4<f32>,
+    roughness : f32,
+    metallic  : f32,
+    emissive  : f32,
+    is_light  : f32,
+};
+
+struct ObjectUniforms {
+    model    : mat4x4<f32>,
+    material : Material,
+    _pad     : vec4<f32>,
+};
+
+@group(0) @binding(0) var<uniform> scene  : SceneUniforms;
+@group(0) @binding(1) var<uniform> object : ObjectUniforms;
+@group(0) @binding(2) var          t_shadow : texture_depth_2d;
+@group(0) @binding(3) var          s_shadow : sampler_comparison;
+
+struct VSOut {
+    @builtin(position) clip_pos   : vec4<f32>,
+    @location(0)       world_pos  : vec3<f32>,
+    @location(1)       normal     : vec3<f32>,
+    @location(2)       tangent    : vec3<f32>,
+    @location(3)       uv         : vec2<f32>,
+    @location(4)       view_dist  : f32,
+    @location(5)       shadow_pos : vec4<f32>,
+};
+
+@vertex
+fn vs_main(
+    @location(0) position : vec3<f32>,
+    @location(1) normal   : vec3<f32>,
+    @location(2) tangent  : vec3<f32>,
+    @location(3) uv       : vec2<f32>,
+) -> VSOut {
+    var out : VSOut;
+
+    let world_pos  = object.model * vec4<f32>(position, 1.0);
+    out.clip_pos   = scene.view_proj * world_pos;
+    out.world_pos  = world_pos.xyz;
+    out.uv         = uv;
+    out.view_dist  = length(scene.camera_pos.xyz - world_pos.xyz);
+    out.shadow_pos = scene.light_view_proj * world_pos;
+
+    let nm = mat3x3<f32>(
+        object.model[0].xyz,
+        object.model[1].xyz,
+        object.model[2].xyz,
+    );
+    out.normal  = normalize(nm * normal);
+    out.tangent = normalize(nm * tangent);
+
+    return out;
+}
+
+// ================================================================
+//  BRDF
+// ================================================================
+
+fn D_GGX(NdH: f32, roughness: f32) -> f32 {
+    let a  = roughness * roughness;
+    let a2 = a * a;
+    let d  = NdH * NdH * (a2 - 1.0) + 1.0;
+    return a2 / (PI * d * d + 0.00001);
+}
+
+fn G_schlick_ggx(NdV: f32, roughness: f32) -> f32 {
+    let r = roughness + 1.0;
+    let k = (r * r) / 8.0;
+    return NdV / (NdV * (1.0 - k) + k);
+}
+
+fn G_smith(NdV: f32, NdL: f32, roughness: f32) -> f32 {
+    return G_schlick_ggx(NdV, roughness) * G_schlick_ggx(NdL, roughness);
+}
+
+fn fresnel_schlick(cos_theta: f32, F0: vec3<f32>) -> vec3<f32> {
+    return F0 + (1.0 - F0) * pow(clamp(1.0 - cos_theta, 0.0, 1.0), 5.0);
+}
+
+fn fresnel_schlick_rough(cos_theta: f32, F0: vec3<f32>, roughness: f32) -> vec3<f32> {
+    return F0 + (max(vec3(1.0 - roughness), F0) - F0) * pow(clamp(1.0 - cos_theta, 0.0, 1.0), 5.0);
+}
+
+// ================================================================
+//  LIGHTING / ATMOSPHERE
+// ================================================================
+
+fn hemisphere_ambient(N: vec3<f32>) -> vec3<f32> {
+    let sky    = vec3<f32>(0.25, 0.35, 0.60);
+    let ground = vec3<f32>(0.15, 0.12, 0.08);
+    return mix(ground, sky, N.y * 0.5 + 0.5);
+}
+
+fn apply_fog(color: vec3<f32>, dist: f32) -> vec3<f32> {
+    let fog     = vec3<f32>(0.01, 0.01, 0.025);
+    let density = 0.038;
+    let f       = exp(-pow(density * dist, 2.0));
+    return mix(fog, color, clamp(f, 0.0, 1.0));
+}
+
+// ACES filmic tone mapping — keeps midtones bright
+fn tonemap(color: vec3<f32>) -> vec3<f32> {
+    let a = 2.51;
+    let b = 0.03;
+    let c = 2.43;
+    let d = 0.59;
+    let e = 0.14;
+    return clamp(
+        (color * (a * color + b)) / (color * (c * color + d) + e),
+        vec3(0.0),
+        vec3(1.0),
+    );
+}
+
+fn checker(uv: vec2<f32>, scale: f32) -> f32 {
+    let p = floor(uv * scale);
+    return fract((p.x + p.y) * 0.5) * 2.0;
+}
+
+fn micro_normal(N: vec3<f32>, T: vec3<f32>, uv: vec2<f32>, strength: f32) -> vec3<f32> {
+    let B  = normalize(cross(N, T));
+    let s  = uv * 8.0;
+    let dx = sin(s.x * 13.7 + s.y * 5.3) * strength;
+    let dy = cos(s.x * 7.1  + s.y * 11.9) * strength;
+    return normalize(N + T * dx + B * dy);
+}
+
+// ================================================================
+//  PCF SHADOW (3x3 unrolled)
+// ================================================================
+
+fn sample_shadow(shadow_pos: vec4<f32>, NdL: f32) -> f32 {
+    let proj  = shadow_pos.xyz / shadow_pos.w;
+    let uv    = vec2<f32>(proj.x * 0.5 + 0.5, -proj.y * 0.5 + 0.5);
+    let depth = proj.z;
+    let bias  = max(0.005 * (1.0 - NdL), 0.001);
+    let texel = 1.0 / 2048.0;
+
+    let in_frustum = f32(
+        uv.x >= 0.0 && uv.x <= 1.0 &&
+        uv.y >= 0.0 && uv.y <= 1.0 &&
+        depth >= 0.0 && depth <= 1.0
+    );
+
+    var shadow = 0.0;
+    shadow += textureSampleCompare(t_shadow, s_shadow, uv + vec2(-texel, -texel), depth - bias);
+    shadow += textureSampleCompare(t_shadow, s_shadow, uv + vec2(  0.0,  -texel), depth - bias);
+    shadow += textureSampleCompare(t_shadow, s_shadow, uv + vec2( texel, -texel), depth - bias);
+    shadow += textureSampleCompare(t_shadow, s_shadow, uv + vec2(-texel,    0.0), depth - bias);
+    shadow += textureSampleCompare(t_shadow, s_shadow, uv + vec2(  0.0,     0.0), depth - bias);
+    shadow += textureSampleCompare(t_shadow, s_shadow, uv + vec2( texel,    0.0), depth - bias);
+    shadow += textureSampleCompare(t_shadow, s_shadow, uv + vec2(-texel,  texel), depth - bias);
+    shadow += textureSampleCompare(t_shadow, s_shadow, uv + vec2(  0.0,   texel), depth - bias);
+    shadow += textureSampleCompare(t_shadow, s_shadow, uv + vec2( texel,  texel), depth - bias);
+    shadow /= 9.0;
+
+    return mix(1.0, shadow, in_frustum);
+}
+
+// ================================================================
+//  PER-LIGHT BRDF
+// ================================================================
+
+fn point_light_brdf(
+    N         : vec3<f32>,
+    V         : vec3<f32>,
+    world_pos : vec3<f32>,
+    F0        : vec3<f32>,
+    albedo    : vec3<f32>,
+    roughness : f32,
+    metallic  : f32,
+    light_pos : vec3<f32>,
+    light_col : vec3<f32>,
+    intensity : f32,
+    shadow    : f32,
+) -> vec3<f32> {
+    let lvec = light_pos - world_pos;
+    let dist = length(lvec);
+    let L    = normalize(lvec);
+    let H    = normalize(V + L);
+
+    let NdL = max(dot(N, L), 0.0);
+    if NdL <= 0.0 { return vec3(0.0); }
+
+    let NdV = max(dot(N, V), 0.0001);
+    let NdH = max(dot(N, H), 0.0);
+    let HdV = max(dot(H, V), 0.0);
+
+    let atten = intensity / (1.0 + 0.14 * dist + 0.07 * dist * dist);
+
+    let D    = D_GGX(NdH, roughness);
+    let G    = G_smith(NdV, NdL, roughness);
+    let F    = fresnel_schlick(HdV, F0);
+    let spec = (D * G * F) / (4.0 * NdV * NdL + 0.0001);
+    let kD   = (1.0 - F) * (1.0 - metallic);
+    let diff = kD * albedo / PI;
+    let rim  = pow(1.0 - NdV, 4.0) * 0.3;
+
+    return (diff + spec) * light_col * NdL * atten * shadow
+         + light_col * rim * atten * 0.3;
+}
+
+// ================================================================
+//  FRAGMENT
+// ================================================================
+
+@fragment
+fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
+
+    let t      = scene.time.x;
+    let mat    = object.material;
+    let albedo = mat.albedo.rgb;
+    let rough  = clamp(mat.roughness, 0.04, 1.0);
+    let metal  = clamp(mat.metallic,  0.0,  1.0);
+
+    // ---- Emissive ----
+    if mat.is_light > 0.5 {
+        let pulse   = 0.7 + 0.3 * sin(t * 5.0 + in.world_pos.x);
+        let core    = albedo * mat.emissive * pulse;
+        let V_em    = normalize(scene.camera_pos.xyz - in.world_pos);
+        let rim_em  = pow(1.0 - max(dot(normalize(in.normal), V_em), 0.0), 2.2);
+        let glow    = albedo * rim_em * mat.emissive * 3.0 * pulse;
+        var out_col = tonemap(core + glow);
+        out_col     = pow(out_col, vec3(1.0 / 2.2));
+        return vec4<f32>(apply_fog(out_col, in.view_dist), 1.0);
+    }
+
+    // ---- Normal ----
+    let raw_N = normalize(in.normal);
+    let T     = normalize(in.tangent);
+    let N     = micro_normal(raw_N, T, in.uv, rough * 0.04);
+    let V     = normalize(scene.camera_pos.xyz - in.world_pos);
+    let NdV   = max(dot(N, V), 0.0001);
+
+    // ---- Shadow ----
+    let L0   = normalize(scene.light_pos[0].xyz - in.world_pos);
+    let NdL0 = max(dot(N, L0), 0.0);
+    let shadow = sample_shadow(in.shadow_pos, NdL0);
+
+    // ---- Surface albedo ----
+    var surface_albedo = albedo;
+    let is_ground      = f32(raw_N.y > 0.95);
+    let check          = checker(in.uv, 4.0);
+    surface_albedo     = mix(surface_albedo, surface_albedo * (0.7 + 0.3 * check), is_ground);
+
+    let F0 = mix(vec3<f32>(0.04), surface_albedo, metal);
+
+    // ---- Light accumulation ----
+    var Lo = vec3<f32>(0.0);
+    for (var i = 0u; i < MAX_LIGHTS; i++) {
+        let lpos    = scene.light_pos[i].xyz;
+        let lcol    = scene.light_color[i].rgb;
+        let lintens = scene.light_color[i].w;
+        if lintens < 0.001 { continue; }
+
+        let s = select(1.0, shadow, i == 0u);
+
+        Lo += point_light_brdf(
+            N, V, in.world_pos, F0, surface_albedo,
+            rough, metal, lpos, lcol, lintens, s,
+        );
+    }
+
+    // ---- Ambient ----
+    let F_amb   = fresnel_schlick_rough(NdV, F0, rough);
+    let kD_amb  = (1.0 - F_amb) * (1.0 - metal);
+    let ambient = kD_amb * hemisphere_ambient(N) * surface_albedo
+                * (0.8 + 0.2 * shadow);
+
+    let ao    = 0.75 + 0.25 * NdV;
+    var color = (Lo + ambient) * ao;
+
+    // Chromatic fringe
+    let fringe = pow(1.0 - NdV, 5.0);
+    color.r   += fringe * 0.06;
+    color.b   += fringe * 0.03;
+
+    color = tonemap(color);
+    color = pow(color, vec3<f32>(1.0 / 2.2));
+
+    return vec4<f32>(apply_fog(color, in.view_dist), 1.0);
+}
