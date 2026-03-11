@@ -37,7 +37,7 @@ pub struct Mesh {
 }
 
 impl Mesh {
-    fn upload(device: &wgpu::Device, vertices: &[Vertex], indices: &[u16], label: &str) -> Self {
+    pub fn upload(device: &wgpu::Device, vertices: &[Vertex], indices: &[u16], label: &str) -> Self {
         let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label:    Some(&format!("{} VB", label)),
             contents: bytemuck::cast_slice(vertices),

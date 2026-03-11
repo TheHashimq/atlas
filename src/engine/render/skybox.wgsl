@@ -2,6 +2,7 @@ struct SkyUniforms {
     view_proj  : mat4x4<f32>,
     camera_pos : vec4<f32>,
     time       : vec4<f32>,
+    sun_dir    : vec4<f32>,   // xyz = normalized direction *toward* sun
 };
 
 @group(0) @binding(0) var<uniform> sky : SkyUniforms;
@@ -11,74 +12,140 @@ struct VSOut {
     @location(0)       ray_dir  : vec3<f32>,
 };
 
-// Fullscreen triangle, ray direction reconstructed from clip pos
+// Fullscreen triangle — reconstruct world-space ray direction
 @vertex
 fn vs_sky(@builtin(vertex_index) vi: u32) -> VSOut {
     let x = f32((vi << 1u) & 2u) * 2.0 - 1.0;
     let y = f32( vi         & 2u) * 2.0 - 1.0;
 
-    // Unproject clip-space corner to world-space ray
-    let inv_vp  = transpose(sky.view_proj); // approximation — good enough for sky
-    let clip    = vec4<f32>(x, y, 1.0, 1.0);
-
     var out : VSOut;
-    out.clip_pos = vec4<f32>(x, y, 1.0, 1.0);  // z=1 → far plane
-    out.ray_dir  = vec3<f32>(x, y, -1.0);       // refined in fragment
+    out.clip_pos = vec4<f32>(x, y, 1.0, 1.0);
+    out.ray_dir  = vec3<f32>(x, y, -1.0);
     return out;
 }
 
-fn hash(p: vec2<f32>) -> f32 {
-    var q = fract(p * vec2<f32>(123.4, 456.7));
-    q += dot(q, q + 45.32);
+// ================================================================
+//  Utilities
+// ================================================================
+
+fn hash3(p: vec3<f32>) -> f32 {
+    var q = fract(p * 0.1031);
+    q += dot(q, q.yzx + 33.33);
+    return fract((q.x + q.y) * q.z);
+}
+
+fn hash21(p: vec2<f32>) -> f32 {
+    var q = fract(p * vec2<f32>(127.1, 311.7));
+    q += dot(q, q + 19.19);
     return fract(q.x * q.y);
 }
 
-fn stars(dir: vec3<f32>, t: f32) -> f32 {
-    // Project direction onto a grid for twinkling stars
-    let uv    = vec2<f32>(atan2(dir.z, dir.x), asin(dir.y)) * 8.0;
-    let cell  = floor(uv);
-    let f     = fract(uv);
-    let h     = hash(cell);
-    let blink = 0.5 + 0.5 * sin(t * (2.0 + h * 4.0) + h * 6.28);
-    let dist  = length(f - vec2(0.5));
-    return smoothstep(0.12, 0.0, dist) * step(0.85, h) * blink;
+// ================================================================
+//  Procedural Starfield
+// ================================================================
+
+fn stars(dir: vec3<f32>) -> f32 {
+    let grid_size = 400.0;
+    let cell      = floor(dir * grid_size);
+    let h         = hash3(cell);
+    let is_star   = step(0.994, h);
+    let brightness = fract(h * 123.456) * 0.6 + 0.15;
+    return is_star * brightness;
 }
+
+// ================================================================
+//  Sun disc + halo rings
+// ================================================================
+
+fn sun_disc(ray: vec3<f32>, sun_dir: vec3<f32>, t: f32) -> vec3<f32> {
+    let cos_angle  = dot(ray, sun_dir);
+    let angle      = acos(clamp(cos_angle, -1.0, 1.0));
+
+    // ---- Disc core ----
+    let disc_radius = 0.038;       // angular radius of sun
+    let edge_soft   = 0.004;
+    let disc_mask   = 1.0 - smoothstep(disc_radius - edge_soft, disc_radius + edge_soft, angle);
+
+    // ---- Hot core gradient ----
+    let core_uv   = angle / disc_radius;
+    let core_t    = clamp(1.0 - core_uv, 0.0, 1.0);
+    let disc_core_col = mix(
+        vec3<f32>(1.0, 0.55, 0.1),   // orange edge
+        vec3<f32>(1.2, 1.1, 0.95),   // white-hot centre (HDR > 1)
+        core_t * core_t,
+    );
+
+    // ---- Corona halo — 3 concentric rings ----
+    let halo1 = exp(-pow(angle / 0.08, 2.0)) * 0.25;
+    let halo2 = exp(-pow(angle / 0.20, 2.0)) * 0.10;
+    let halo3 = exp(-pow(angle / 0.50, 2.0)) * 0.04;
+    let halo  = halo1 + halo2 + halo3;
+    let halo_col = vec3<f32>(1.0, 0.65, 0.2) * halo;
+
+    // ---- Animated lens flare chromatic rings ----
+    //  project ray onto a 2D plane perpendicular to sun_dir
+    let up      = normalize(vec3<f32>(0.0, 1.0, 0.001));   // avoid degenerate
+    let right   = normalize(cross(sun_dir, up));
+    let screen_y= normalize(cross(right, sun_dir));
+    let px      = dot(ray - sun_dir * cos_angle, right);
+    let py      = dot(ray - sun_dir * cos_angle, screen_y);
+    let ring_r  = sqrt(px * px + py * py);
+
+    // rotating shimmer
+    let theta   = atan2(py, px) + t * 0.05;
+    let shimmer = 0.5 + 0.5 * sin(theta * 6.0 + t * 0.3);
+
+    let flare_ring = exp(-pow((ring_r - 0.13) / 0.012, 2.0)) * shimmer * 0.18
+                   + exp(-pow((ring_r - 0.22) / 0.010, 2.0)) * shimmer * 0.10
+                   + exp(-pow((ring_r - 0.35) / 0.018, 2.0)) * shimmer * 0.06;
+    let flare_col = vec3<f32>(0.8, 0.5, 1.0) * flare_ring;  // slight violet
+
+    // ---- Combine ----
+    let disc_out = disc_core_col * disc_mask * 6.0;
+    return disc_out + halo_col + flare_col;
+}
+
+// ================================================================
+//  Sky gradient
+// ================================================================
+
+fn sky_gradient(ray_dir: vec3<f32>) -> vec3<f32> {
+    // Subtle deep-space gradient — brighter near the sun horizon
+    let horizon = exp(-max(ray_dir.y, 0.0) * 3.5);
+    let zenith  = vec3<f32>(0.004, 0.006, 0.016);
+    let horiz   = vec3<f32>(0.012, 0.008, 0.020);
+    return mix(zenith, horiz, horizon);
+}
+
+// ================================================================
+//  Fragment
+// ================================================================
 
 @fragment
 fn fs_sky(in: VSOut) -> @location(0) vec4<f32> {
-    let t = sky.time.x;
-
-    // Reconstruct view ray from camera
+    // Proper ray reconstruction via inverse view-projection
+    let inv_vp  = transpose(sky.view_proj);
+    let clip    = vec4<f32>(in.ray_dir.xy, 1.0, 1.0);
+    // Simple: use the clip.xy as view direction (works for perspective sky)
     let ray = normalize(in.ray_dir);
 
-    // Horizon blend
-    let h = ray.y;  // -1=down, 1=up
+    let t = sky.time.x;
 
-    // Sky gradient: deep navy → midnight purple → near-black at zenith
-    let zenith   = vec3<f32>(0.02, 0.02, 0.08);
-    let horizon  = vec3<f32>(0.08, 0.06, 0.18);
-    let ground   = vec3<f32>(0.02, 0.015, 0.01);
+    // ---- Background ----
+    let bg_col = sky_gradient(ray);
 
-    var sky_col : vec3<f32>;
-    if h > 0.0 {
-        sky_col = mix(horizon, zenith, pow(h, 0.4));
-    } else {
-        sky_col = mix(horizon, ground, pow(-h, 0.5));
-    }
+    // ---- Stars (on hemisphere only, fade near sun) ----
+    let sun_dot   = max(dot(ray, sky.sun_dir.xyz), 0.0);
+    let star_mask = 1.0 - smoothstep(0.2, 0.8, sun_dot);  // hide stars near sun
+    let star_val  = stars(ray) * star_mask;
+    // Twinkle
+    let cell     = floor(ray * 400.0);
+    let twinkle  = 0.7 + 0.3 * sin(t * (hash3(cell) * 3.0 + 1.0) + hash3(cell + 1.0) * 6.28);
+    let star_col = vec3<f32>(0.88, 0.93, 1.0) * star_val * twinkle;
 
-    // Subtle animated nebula wisps
-    let wisp_uv = vec2<f32>(ray.x + t * 0.008, ray.z + t * 0.005);
-    let wisp    = hash(wisp_uv * 3.0) * 0.04 * smoothstep(0.0, 0.5, h);
-    sky_col    += vec3<f32>(0.3, 0.1, 0.5) * wisp;
+    // ---- Sun ----
+    let sun_col = sun_disc(ray, sky.sun_dir.xyz, t);
 
-    // Stars (only above horizon)
-    let star = stars(ray, t) * smoothstep(-0.05, 0.1, h);
-    sky_col  += vec3<f32>(0.9, 0.95, 1.0) * star;
-
-    // Subtle warm glow near horizon (light source direction)
-    let sun_dir  = normalize(vec3<f32>(1.0, 0.1, 0.5));
-    let sun_dot  = max(dot(ray, sun_dir), 0.0);
-    sky_col     += vec3<f32>(0.4, 0.2, 0.05) * pow(sun_dot, 6.0) * 0.3;
-
-    return vec4<f32>(sky_col, 1.0);
+    let final_col = bg_col + star_col + sun_col;
+    return vec4<f32>(final_col, 1.0);
 }

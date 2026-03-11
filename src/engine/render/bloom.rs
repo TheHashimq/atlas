@@ -1,36 +1,43 @@
 use wgpu::{Device, TextureFormat, TextureView, Texture};
 
 pub struct BloomPass {
-    // Downsample → blur → upsample textures
-    pub ping_texture  : Texture,
-    pub ping_view     : TextureView,
-    pub pong_texture  : Texture,
-    pub pong_view     : TextureView,
+    pub ping_texture : Texture,
+    pub ping_view    : TextureView,
+    pub pong_texture : Texture,
+    pub pong_view    : TextureView,
 
-    // Pipelines
-    pub threshold_pipeline  : wgpu::RenderPipeline,
-    pub blur_h_pipeline     : wgpu::RenderPipeline,
-    pub blur_v_pipeline     : wgpu::RenderPipeline,
-    pub composite_pipeline  : wgpu::RenderPipeline,
+    pub threshold_pipeline : wgpu::RenderPipeline,
+    pub blur_h_pipeline    : wgpu::RenderPipeline,
+    pub blur_v_pipeline    : wgpu::RenderPipeline,
+    pub composite_pipeline : wgpu::RenderPipeline,
+    pub blit_pipeline      : wgpu::RenderPipeline,  // HDR → LDR tonemap blit
 
-    // Layouts
-    pub blit_layout   : wgpu::BindGroupLayout,
-    pub sampler       : wgpu::Sampler,
+    pub blit_layout : wgpu::BindGroupLayout,
+    pub sampler     : wgpu::Sampler,
 }
 
 impl BloomPass {
     pub fn new(device: &Device, format: TextureFormat, width: u32, height: u32) -> Self {
-        let bw = (width  / 2).max(1);
-        let bh = (height / 2).max(1);
+        Self::new_with_formats(device, format, format, width, height)
+    }
 
+    /// input_format  = HDR texture format (Rgba16Float)
+    /// output_format = swapchain format (Rgba8Unorm etc.)
+    pub fn new_with_formats(
+        device        : &Device,
+        input_format  : TextureFormat,
+        output_format : TextureFormat,
+        width         : u32,
+        height        : u32,
+    ) -> Self {
         let make_tex = |label: &str| {
             let t = device.create_texture(&wgpu::TextureDescriptor {
                 label:           Some(label),
-                size:            wgpu::Extent3d { width: bw, height: bh, depth_or_array_layers: 1 },
+                size:            wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
                 mip_level_count: 1,
                 sample_count:    1,
                 dimension:       wgpu::TextureDimension::D2,
-                format,
+                format:          input_format,  // bloom buffers stay HDR
                 usage:           wgpu::TextureUsages::RENDER_ATTACHMENT
                                | wgpu::TextureUsages::TEXTURE_BINDING,
                 view_formats:    &[],
@@ -84,7 +91,8 @@ impl BloomPass {
             source: wgpu::ShaderSource::Wgsl(include_str!("bloom.wgsl").into()),
         });
 
-        let make_pipeline = |entry: &'static str| {
+        // Helper: pipeline that writes to input_format (HDR intermediate)
+        let hdr_pipeline = |entry: &'static str| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label:  Some(entry),
                 layout: Some(&pl),
@@ -97,7 +105,36 @@ impl BloomPass {
                 fragment: Some(wgpu::FragmentState {
                     module:              &shader,
                     entry_point:         Some(entry),
-                    targets:             &[Some(format.into())],
+                    targets:             &[Some(input_format.into())],
+                    compilation_options: Default::default(),
+                }),
+                primitive:     wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample:   Default::default(),
+                multiview:     None,
+                cache:         None,
+            })
+        };
+
+        // Helper: pipeline that writes to output_format (swapchain / LDR)
+        let ldr_pipeline = |entry: &'static str, blend: Option<wgpu::BlendState>| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label:  Some(entry),
+                layout: Some(&pl),
+                vertex: wgpu::VertexState {
+                    module:              &shader,
+                    entry_point:         Some("vs_fullscreen"),
+                    buffers:             &[],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module:              &shader,
+                    entry_point:         Some(entry),
+                    targets:             &[Some(wgpu::ColorTargetState {
+                        format: output_format,
+                        blend,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
                     compilation_options: Default::default(),
                 }),
                 primitive:     wgpu::PrimitiveState::default(),
@@ -111,10 +148,18 @@ impl BloomPass {
         Self {
             ping_texture, ping_view,
             pong_texture, pong_view,
-            threshold_pipeline : make_pipeline("fs_threshold"),
-            blur_h_pipeline    : make_pipeline("fs_blur_h"),
-            blur_v_pipeline    : make_pipeline("fs_blur_v"),
-            composite_pipeline : make_pipeline("fs_composite"),
+            threshold_pipeline : hdr_pipeline("fs_threshold"),
+            blur_h_pipeline    : hdr_pipeline("fs_blur_h"),
+            blur_v_pipeline    : hdr_pipeline("fs_blur_v"),
+            composite_pipeline : ldr_pipeline("fs_composite", Some(wgpu::BlendState {
+                color: wgpu::BlendComponent {
+                    src_factor: wgpu::BlendFactor::One,
+                    dst_factor: wgpu::BlendFactor::One,
+                    operation:  wgpu::BlendOperation::Add,
+                },
+                alpha: wgpu::BlendComponent::REPLACE,
+            })),
+            blit_pipeline      : ldr_pipeline("fs_blit", None), // LDR tonemap blit
             blit_layout,
             sampler,
         }
@@ -131,12 +176,11 @@ impl BloomPass {
         })
     }
 
-    /// scene_view  = the HDR scene texture (before bloom)
-    /// output_view = the final swapchain view
+    /// Full bloom: threshold → blur → composite onto swapchain
     pub fn execute(
         &self,
-        device   : &wgpu::Device,
-        encoder  : &mut wgpu::CommandEncoder,
+        device      : &wgpu::Device,
+        encoder     : &mut wgpu::CommandEncoder,
         scene_view  : &TextureView,
         output_view : &TextureView,
     ) {
@@ -144,54 +188,29 @@ impl BloomPass {
         let ping_bg  = self.make_bg(device, &self.ping_view);
         let pong_bg  = self.make_bg(device, &self.pong_view);
 
-        // 1. Threshold — extract bright pixels into ping
+        // 1. Threshold — extract bright pixels
         self.run_pass(encoder, &self.ping_view, &self.threshold_pipeline, &scene_bg, "Bloom Threshold");
-
-        // 2. Horizontal blur ping → pong
+        // 2. H blur
         self.run_pass(encoder, &self.pong_view, &self.blur_h_pipeline, &ping_bg, "Bloom BlurH");
-
-        // 3. Vertical blur pong → ping
+        // 3. V blur
         self.run_pass(encoder, &self.ping_view, &self.blur_v_pipeline, &pong_bg, "Bloom BlurV");
-
-        // 4. Composite — scene + bloom ping → output
-        // Need two textures bound for composite — use scene_bg + ping
-        // We'll do scene in binding 0, bloom in a second bind group isn't
-        // possible with current layout, so composite reads scene from ping
-        // via the additive blend — scene was already written to output by
-        // the main pass, so we just additively blend bloom on top.
+        // 4. Blit HDR scene → swapchain with ACES tone mapping
+        self.blit_to_output(device, encoder, scene_view, output_view);
+        // 5. Additively blend bloom on top
         self.run_pass_additive(encoder, output_view, &self.composite_pipeline, &ping_bg, "Bloom Composite");
     }
 
+    /// Plain blit for Low quality — just ACES tonemap, no bloom
     pub fn blit_to_output(
-    &self,
-    device      : &wgpu::Device,
-    encoder     : &mut wgpu::CommandEncoder,
-    scene_view  : &TextureView,
-    output_view : &TextureView,
-) {
-    let bg = self.make_bg(device, scene_view);
-
-    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-        label: Some("Bloom HDR Blit"),
-        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-            view: output_view,
-            resolve_target: None,
-            ops: wgpu::Operations {
-                load:  wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                store: wgpu::StoreOp::Store,
-            },
-            depth_slice: None,
-        })],
-        depth_stencil_attachment: None,
-        occlusion_query_set: None,
-        timestamp_writes: None,
-    });
-
-    // reuse threshold pipeline as simple texture blit
-    pass.set_pipeline(&self.threshold_pipeline);
-    pass.set_bind_group(0, &bg, &[]);
-    pass.draw(0..3, 0..1);
-}
+        &self,
+        device      : &wgpu::Device,
+        encoder     : &mut wgpu::CommandEncoder,
+        scene_view  : &TextureView,
+        output_view : &TextureView,
+    ) {
+        let bg = self.make_bg(device, scene_view);
+        self.run_pass(encoder, output_view, &self.blit_pipeline, &bg, "HDR Blit");
+    }
 
     fn run_pass(
         &self,
@@ -204,8 +223,7 @@ impl BloomPass {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some(label),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view:           target,
-                resolve_target: None,
+                view: target, resolve_target: None,
                 ops: wgpu::Operations {
                     load:  wgpu::LoadOp::Clear(wgpu::Color::BLACK),
                     store: wgpu::StoreOp::Store,
@@ -218,7 +236,7 @@ impl BloomPass {
         });
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, bg, &[]);
-        pass.draw(0..3, 0..1);  // fullscreen triangle
+        pass.draw(0..3, 0..1);
     }
 
     fn run_pass_additive(
@@ -232,10 +250,9 @@ impl BloomPass {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some(label),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view:           target,
-                resolve_target: None,
+                view: target, resolve_target: None,
                 ops: wgpu::Operations {
-                    load:  wgpu::LoadOp::Load,   // keep existing scene pixels
+                    load:  wgpu::LoadOp::Load,
                     store: wgpu::StoreOp::Store,
                 },
                 depth_slice: None,

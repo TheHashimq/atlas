@@ -10,7 +10,7 @@ crate-type = ["cdylib", "rlib"]
 wgpu = "27"
 bytemuck = { version = "1.14", features = ["derive"] }
 glam = "0.27"
-gltf = "1.4"
+gltf = { version = "1.4", features = ["KHR_materials_pbrSpecularGlossiness"] }
 wasm-bindgen-futures = "0.4"
 wasm-bindgen = "0.2"
 js-sys = "0.3"
@@ -20,7 +20,15 @@ web-sys = { version = "0.3", features = [
     "Document",
     "HtmlCanvasElement",
     "MouseEvent",
-"WheelEvent",
+    "WheelEvent",
+    "KeyboardEvent",
+    "Performance",
+    "Response",
+    "Request",
+    "RequestInit",
+    "RequestMode",
+    "Headers",
+    "Location",
 ] }
 
 console_error_panic_hook = "0.1"
@@ -28,6 +36,16 @@ wee_alloc = "0.4"
 log = "0.4"
 console_log = "1.0"
 
+
+[dev-dependencies]
+wasm-bindgen-test = "0.3"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+axum = "0.7"
+tower-http = { version = "0.5", features = ["fs", "trace", "cors", "set-status"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+clap = { version = "4.4", features = ["derive"] }
+env_logger = "0.10"
 
 [profile.release]
 opt-level = "z"

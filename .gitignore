@@ -1,0 +1,9 @@
+/target
+Cargo.lock
+**/*.bak
+**/*.Zone.Identifier
+models/*.glb
+*.bak
+*.Zone.Identifier
+models/*.glb
+target/

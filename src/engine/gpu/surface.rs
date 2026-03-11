@@ -8,8 +8,13 @@ pub struct GpuSurface<'a> {
 
 impl<'a> GpuSurface<'a> {
     pub fn new(instance: &Instance, canvas: &'a HtmlCanvasElement) -> GpuSurface<'a> {
+        #[cfg(target_arch = "wasm32")]
+        let target = wgpu::SurfaceTarget::Canvas(canvas.clone());
+        #[cfg(not(target_arch = "wasm32"))]
+        let target: wgpu::SurfaceTarget = unimplemented!("Canvas surface is only supported on wasm32-unknown-unknown");
+
         let surface = instance
-            .create_surface(wgpu::SurfaceTarget::Canvas(canvas.clone()))
+            .create_surface(target)
             .expect("Failed to create surface");
 
         let width = canvas.width().max(1);

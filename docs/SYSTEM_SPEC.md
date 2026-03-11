@@ -191,6 +191,11 @@ No module may depend on a lower-level subsystem unless explicitly allowed.
         encoder  : &mut wgpu::CommandEncoder,
         scene_view  : &TextureView,
         output_view : &TextureView,) -> ()`
+- `pub fn blit_to_output(&self,
+    device      : &wgpu::Device,
+    encoder     : &mut wgpu::CommandEncoder,
+    scene_view  : &TextureView,
+    output_view : &TextureView,) -> ()`
 - `private fn run_pass(&self,
         encoder  : &mut wgpu::CommandEncoder,
         target   : &TextureView,
