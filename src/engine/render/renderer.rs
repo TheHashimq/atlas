@@ -1,3 +1,4 @@
+use std::rc::Rc;
 use wgpu::{
     BindGroup, BindGroupLayout, Buffer,
     Device, Queue, RenderPipeline, Texture, TextureFormat, TextureView,
@@ -6,7 +7,8 @@ use wgpu::{
 use crate::{
     engine::{
         gpu::bind_group::{
-            create_main_pass_bind_group, create_main_pass_layout,
+            create_global_bind_group,
+            create_material_bind_group,
             create_shadow_pass_layout, create_uniform_bind_group,
         },
         render::{
@@ -126,18 +128,23 @@ struct FrameBuffers {
     sky_buf      : Buffer,
     shadow_bufs  : Vec<Buffer>,
     object_bufs  : Vec<Buffer>,
-    shadow_bgs   : Vec<BindGroup>,
-    main_bgs     : Vec<BindGroup>,
+    global_bg    : BindGroup,
+    material_bgs : Vec<BindGroup>,
     object_count : usize,
 }
 
 impl FrameBuffers {
-    fn new(
-        device        : &Device,
-        main_layout   : &BindGroupLayout,
-        shadow_layout : &BindGroupLayout,
-        shadow_map    : &ShadowMap,
-        count         : usize,
+    pub fn new(
+        device          : &Device,
+        global_layout   : &BindGroupLayout,
+        material_layout : &BindGroupLayout,
+        shadow_map      : &ShadowMap,
+        default_texture : &TextureView,
+        default_mr      : &TextureView,
+        default_normal  : &TextureView,
+        default_occl    : &TextureView,
+        default_sampler : &wgpu::Sampler,
+        count           : usize,
     ) -> Self {
         let scene_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label:              Some("Scene UB"),
@@ -153,54 +160,59 @@ impl FrameBuffers {
             mapped_at_creation: false,
         });
 
+        let global_bg = create_global_bind_group(
+            device, global_layout, &scene_buf, &shadow_map.view, &shadow_map.sampler,
+        );
+
         let mut shadow_bufs = Vec::with_capacity(count);
         let mut object_bufs = Vec::with_capacity(count);
-        let mut shadow_bgs  = Vec::with_capacity(count);
-        let mut main_bgs    = Vec::with_capacity(count);
+        let mut material_bgs = Vec::with_capacity(count);
 
-        for _ in 0..count {
-            let sb = device.create_buffer(&wgpu::BufferDescriptor {
+        for _i in 0..count {
+            shadow_bufs.push(device.create_buffer(&wgpu::BufferDescriptor {
                 label:              Some("Shadow UB"),
                 size:               std::mem::size_of::<ShadowUniforms>() as u64,
                 usage:              wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
-            });
-            let sg = create_uniform_bind_group(device, shadow_layout, &sb);
-            shadow_bufs.push(sb);
-            shadow_bgs.push(sg);
-
+            }));
             let ob = device.create_buffer(&wgpu::BufferDescriptor {
                 label:              Some("Object UB"),
                 size:               std::mem::size_of::<ObjectUniforms>() as u64,
                 usage:              wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
-            let mg = create_main_pass_bind_group(
-                device, main_layout, &scene_buf, &ob,
-                &shadow_map.view, &shadow_map.sampler,
+            let mg = create_material_bind_group(
+                device, material_layout, &ob,
+                default_texture, default_mr, default_normal, default_texture, default_occl,
+                default_sampler,
             );
             object_bufs.push(ob);
-            main_bgs.push(mg);
+            material_bgs.push(mg);
         }
 
         Self {
             scene_buf, sky_buf,
             shadow_bufs, object_bufs,
-            shadow_bgs, main_bgs,
+            global_bg, material_bgs,
             object_count: count,
         }
     }
 
     fn ensure_capacity(
         &mut self,
-        device        : &Device,
-        main_layout   : &BindGroupLayout,
-        shadow_layout : &BindGroupLayout,
-        shadow_map    : &ShadowMap,
-        needed        : usize,
+        device          : &Device,
+        global_layout   : &BindGroupLayout,
+        material_layout : &BindGroupLayout,
+        shadow_map      : &ShadowMap,
+        default_texture : &TextureView,
+        default_mr      : &TextureView,
+        default_normal  : &TextureView,
+        default_occl    : &TextureView,
+        default_sampler : &wgpu::Sampler,
+        needed          : usize,
     ) {
         if needed <= self.object_count { return; }
-        *self = Self::new(device, main_layout, shadow_layout, shadow_map, needed.max(MAX_OBJECTS));
+        *self = Self::new(device, global_layout, material_layout, shadow_map, default_texture, default_mr, default_normal, default_occl, default_sampler, needed.max(MAX_OBJECTS));
     }
 }
 
@@ -218,7 +230,8 @@ pub struct Renderer {
     shadow_layout   : BindGroupLayout,
 
     main_pipeline   : RenderPipeline,
-    main_layout     : BindGroupLayout,
+    global_layout   : BindGroupLayout,
+    material_layout : BindGroupLayout,
 
     skybox          : Skybox,
     bloom           : BloomPass,
@@ -229,6 +242,12 @@ pub struct Renderer {
 
     frame_buffers   : FrameBuffers,
 
+    pub default_texture : Rc<wgpu::TextureView>,
+    pub default_mr      : Rc<wgpu::TextureView>,
+    pub default_normal  : Rc<wgpu::TextureView>,
+    pub default_occl    : Rc<wgpu::TextureView>,
+    pub default_sampler : Rc<wgpu::Sampler>,
+
     width           : u32,
     height          : u32,
 }
@@ -236,15 +255,17 @@ pub struct Renderer {
 impl Renderer {
     pub fn new(
         device         : &Device,
+        queue          : &Queue,
         surface_format : TextureFormat,
         width          : u32,
         height         : u32,
     ) -> Self {
-        Self::new_with_quality(device, surface_format, width, height, QualityTier::Balanced)
+        Self::new_with_quality(device, queue, surface_format, width, height, QualityTier::Balanced)
     }
 
     pub fn new_with_quality(
         device         : &Device,
+        queue          : &Queue,
         surface_format : TextureFormat,
         width          : u32,
         height         : u32,
@@ -253,9 +274,10 @@ impl Renderer {
         let shadow_layout   = create_shadow_pass_layout(device);
         let shadow_pipeline = Self::make_shadow_pipeline(device, &shadow_layout);
 
-        let main_layout   = create_main_pass_layout(device);
-        let main_pipeline = Self::make_main_pipeline(device, &main_layout, HDR_FORMAT);
-        let skybox        = Skybox::new(device, HDR_FORMAT);
+        let global_layout   = crate::engine::gpu::bind_group::create_global_layout(device);
+        let material_layout = crate::engine::gpu::bind_group::create_material_layout(device);
+        let main_pipeline   = Self::make_main_pipeline(device, &global_layout, &material_layout, HDR_FORMAT);
+        let skybox          = Skybox::new(device, HDR_FORMAT);
 
         let bloom_div = quality.bloom_divisor();
         let bloom     = BloomPass::new_with_formats(
@@ -270,8 +292,98 @@ impl Renderer {
         let hdr_target  = HdrTarget::new(device, width, height);
         let (depth_texture, depth_view) = Self::make_depth(device, width, height);
 
+        let default_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Default White Texture"),
+            size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &default_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &[255, 255, 255, 255],
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(4),
+                rows_per_image: Some(1),
+            },
+            wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+        );
+
+        let default_view = Rc::new(default_texture.create_view(&wgpu::TextureViewDescriptor::default()));
+
+        // Default Normal (Flat blue: 128, 128, 255)
+        let default_normal_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Default Normal Texture"),
+            size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &default_normal_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &[128, 128, 255, 255],
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(4),
+                rows_per_image: Some(1),
+            },
+            wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+        );
+        let default_normal_view = Rc::new(default_normal_texture.create_view(&wgpu::TextureViewDescriptor::default()));
+
+        // Default MR (Metallic=0, Roughness=0.5 -> grey)
+        let default_mr_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Default MR Texture"),
+            size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &default_mr_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &[255, 128, 0, 255], // R=1 (unused), G=0.5 (roughness), B=0 (metallic)
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(4),
+                rows_per_image: Some(1),
+            },
+            wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+        );
+        let default_mr_view = Rc::new(default_mr_texture.create_view(&wgpu::TextureViewDescriptor::default()));
+        let default_occl_view = default_view.clone();
+
+        let default_sampler = Rc::new(device.create_sampler(&wgpu::SamplerDescriptor {
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::Repeat,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Linear, // Trilinear filtering enabled
+            ..Default::default()
+        }));
+
         let frame_buffers = FrameBuffers::new(
-            device, &main_layout, &shadow_layout, &shadow_map, MAX_OBJECTS,
+            device, &global_layout, &material_layout, &shadow_map, &default_view, &default_mr_view, &default_normal_view, &default_occl_view, &default_sampler, MAX_OBJECTS,
         );
 
         Self {
@@ -279,10 +391,15 @@ impl Renderer {
             quality,
             skip_effects: false,
             shadow_map, shadow_pipeline, shadow_layout,
-            main_pipeline, main_layout,
+            main_pipeline, global_layout, material_layout,
             skybox, bloom,
             hdr_target, depth_texture, depth_view,
             frame_buffers,
+            default_texture: default_view,
+            default_mr:      default_mr_view,
+            default_normal:  default_normal_view,
+            default_occl:    default_occl_view,
+            default_sampler,
             width, height,
         }
     }
@@ -355,13 +472,16 @@ impl Renderer {
     }
 
     fn make_main_pipeline(
-        device : &Device,
-        layout : &BindGroupLayout,
-        format : TextureFormat,
+        device          : &Device,
+        global_layout   : &BindGroupLayout,
+        material_layout : &BindGroupLayout,
+        format          : TextureFormat,
     ) -> RenderPipeline {
         use crate::engine::render::mesh::Vertex;
         let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("Main PL"), bind_group_layouts: &[layout], push_constant_ranges: &[],
+            label: Some("Main PL"),
+            bind_group_layouts: &[global_layout, material_layout],
+            push_constant_ranges: &[],
         });
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label:  Some("Main Shader"),
@@ -406,11 +526,12 @@ impl Renderer {
         queue  : &Queue,
         view   : &TextureView,
         scene  : &Scene,
+        vp_override: Option<glam::Mat4>,
     ) {
         let time       = js_sys::Date::now() as f32 * 0.001;
         let light_vp   = Self::light_view_proj(scene);
         let camera_ref = scene.camera.borrow();
-        let view_proj  = camera_ref.view_projection();
+        let view_proj  = vp_override.unwrap_or_else(|| camera_ref.view_projection());
         let camera_pos = camera_ref.position;
         drop(camera_ref);
 
@@ -453,13 +574,32 @@ impl Renderer {
 
         let obj_count = scene.objects.len();
         self.frame_buffers.ensure_capacity(
-            device, &self.main_layout, &self.shadow_layout, &self.shadow_map, obj_count,
+            device, &self.global_layout, &self.material_layout, &self.shadow_map,
+            &self.default_texture, &self.default_mr, &self.default_normal, &self.default_occl, &self.default_sampler, obj_count,
         );
 
         queue.write_buffer(&self.frame_buffers.scene_buf, 0, bytemuck::bytes_of(&scene_ub));
         queue.write_buffer(&self.frame_buffers.sky_buf,   0, bytemuck::bytes_of(&sky_ub));
 
+        // Group 0: Global (Scene + Shadows)
+        self.frame_buffers.global_bg = create_global_bind_group(
+            device, &self.global_layout, &self.frame_buffers.scene_buf,
+            &self.shadow_map.view, &self.shadow_map.sampler,
+        );
+
         for (i, obj) in scene.objects.iter().enumerate() {
+            let base_color = obj.base_color_tex.as_ref().map(|v| v.as_ref()).unwrap_or(&self.default_texture);
+            let mr_tex     = obj.metallic_rough_tex.as_ref().map(|v| v.as_ref()).unwrap_or(&self.default_mr);
+            let normal_map = obj.normal_tex.as_ref().map(|v| v.as_ref()).unwrap_or(&self.default_normal); 
+            let emissive   = obj.emissive_tex.as_ref().map(|v| v.as_ref()).unwrap_or(&self.default_texture); 
+            let occlusion  = obj.occlusion_tex.as_ref().map(|v| v.as_ref()).unwrap_or(&self.default_occl);
+            let sampler    = obj.sampler.as_ref().map(|s| s.as_ref()).unwrap_or(&self.default_sampler);
+
+            let mg = crate::engine::gpu::bind_group::create_material_bind_group(
+                device, &self.material_layout, &self.frame_buffers.object_bufs[i],
+                base_color, mr_tex, normal_map, emissive, occlusion, sampler,
+            );
+
             let model = obj.transform.borrow().matrix();
             let su = ShadowUniforms {
                 light_view_proj: light_vp.to_cols_array_2d(),
@@ -473,6 +613,8 @@ impl Renderer {
                 _pad:     [0.0; 4],
             };
             queue.write_buffer(&self.frame_buffers.object_bufs[i], 0, bytemuck::bytes_of(&ou));
+
+            self.frame_buffers.material_bgs[i] = mg;
         }
 
         let sky_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -506,9 +648,10 @@ impl Renderer {
             pass.set_pipeline(&self.shadow_pipeline);
             for (i, obj) in scene.objects.iter().enumerate() {
                 if obj.material.is_light > 0.5 { continue; }
-                pass.set_bind_group(0, &self.frame_buffers.shadow_bgs[i], &[]);
+                let shadow_bg = create_uniform_bind_group(device, &self.shadow_layout, &self.frame_buffers.shadow_bufs[i]);
+                pass.set_bind_group(0, &shadow_bg, &[]);
                 pass.set_vertex_buffer(0, obj.mesh.vertex_buffer.slice(..));
-                pass.set_index_buffer(obj.mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+                pass.set_index_buffer(obj.mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..obj.mesh.index_count, 0, 0..1);
             }
         }
@@ -575,10 +718,11 @@ impl Renderer {
                 occlusion_query_set: None, timestamp_writes: None,
             });
             pass.set_pipeline(&self.main_pipeline);
+            pass.set_bind_group(0, &self.frame_buffers.global_bg, &[]);
             for (i, obj) in scene.objects.iter().enumerate() {
-                pass.set_bind_group(0, &self.frame_buffers.main_bgs[i], &[]);
+                pass.set_bind_group(1, &self.frame_buffers.material_bgs[i], &[]);
                 pass.set_vertex_buffer(0, obj.mesh.vertex_buffer.slice(..));
-                pass.set_index_buffer(obj.mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+                pass.set_index_buffer(obj.mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..obj.mesh.index_count, 0, 0..1);
             }
         }

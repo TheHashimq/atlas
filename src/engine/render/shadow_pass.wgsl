@@ -8,10 +8,8 @@ struct ShadowUniforms {
 @vertex
 fn vs_shadow(
     @location(0) position : vec3<f32>,
-    // normal/tangent/uv ignored in shadow pass
-    @location(1) _normal  : vec3<f32>,
-    @location(2) _tangent : vec3<f32>,
-    @location(3) _uv      : vec2<f32>,
+    @location(1) normal   : vec3<f32>,
+    @location(2) uv       : vec2<f32>,
 ) -> @builtin(position) vec4<f32> {
     return shadow.light_view_proj * shadow.model * vec4<f32>(position, 1.0);
 }

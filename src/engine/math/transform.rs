@@ -23,6 +23,13 @@ impl Transform {
             self.translation,
         )
     }
+
+    pub fn set_from_matrix(&mut self, m: Mat4) {
+        let (s, r, t) = m.to_scale_rotation_translation();
+        self.scale = s;
+        self.rotation = r;
+        self.translation = t;
+    }
 }
 
 #[cfg(test)]
@@ -51,8 +58,25 @@ mod tests {
         
         // Assert point correctly scales then translates
         let p = Vec3::new(10.0, 0.0, 0.0);
-        let transformed = m.project_point3(p); // project_point3 applies (M * (p, 1)).xyz
+        let transformed = m.project_point3(p); 
         
-        assert_eq!(transformed, Vec3::new(7.0, 3.0, 4.0)); // 10*0.5 + 2 = 7
+        assert_eq!(transformed, Vec3::new(7.0, 3.0, 4.0)); 
+    }
+
+    #[test]
+    fn test_set_from_matrix() {
+        let m = glam::Mat4::from_scale_rotation_translation(
+            Vec3::new(2.0, 2.0, 2.0),
+            Quat::from_rotation_y(90f32.to_radians()),
+            Vec3::new(10.0, -5.0, 0.0),
+        );
+        
+        let mut t = Transform::identity();
+        t.set_from_matrix(m);
+        
+        assert!((t.translation - Vec3::new(10.0, -5.0, 0.0)).length() < 0.001);
+        assert!((t.scale - Vec3::new(2.0, 2.0, 2.0)).length() < 0.001);
+        // Quat comparison might need a bit of epsilon
+        assert!(t.rotation.abs_diff_eq(Quat::from_rotation_y(90f32.to_radians()), 0.001));
     }
 }

@@ -44,11 +44,10 @@ fn hash21(p: vec2<f32>) -> f32 {
 //  Procedural Starfield
 // ================================================================
 
-fn stars(dir: vec3<f32>) -> f32 {
-    let grid_size = 400.0;
-    let cell      = floor(dir * grid_size);
+fn stars(dir: vec3<f32>, offset: vec3<f32>, grid_size: f32, threshold: f32) -> f32 {
+    let cell      = floor((dir + offset) * grid_size);
     let h         = hash3(cell);
-    let is_star   = step(0.994, h);
+    let is_star   = step(threshold, h);
     let brightness = fract(h * 123.456) * 0.6 + 0.15;
     return is_star * brightness;
 }
@@ -134,14 +133,25 @@ fn fs_sky(in: VSOut) -> @location(0) vec4<f32> {
     // ---- Background ----
     let bg_col = sky_gradient(ray);
 
-    // ---- Stars (on hemisphere only, fade near sun) ----
+    // ---- Stars (Multi-Layer Parallax) ----
     let sun_dot   = max(dot(ray, sky.sun_dir.xyz), 0.0);
-    let star_mask = 1.0 - smoothstep(0.2, 0.8, sun_dot);  // hide stars near sun
-    let star_val  = stars(ray) * star_mask;
-    // Twinkle
-    let cell     = floor(ray * 400.0);
+    let star_mask = 1.0 - smoothstep(0.2, 0.8, sun_dot);
+    
+    // Layer 1: Far stars (tiny, static)
+    let star1 = stars(ray, vec3(0.0), 500.0, 0.992) * 0.6;
+    
+    // Layer 2: Near stars (larger, parallax)
+    // Offset based on view direction to create depth
+    let parallax = ray * 0.02; 
+    let stars1 = stars(ray, parallax, 25.0, 0.98); // Top Layer
+    let stars2 = stars(ray, parallax * 0.4, 45.0, 0.99); // Mid Layer
+    let stars3 = stars(ray, parallax * 0.1, 75.0, 0.995); // Deepest Layer (Tiny)
+    let star_val = (star1 + stars1 + stars2 + stars3) * star_mask;
+    
+    // Twinkle (based on far-star cell)
+    let cell     = floor(ray * 500.0);
     let twinkle  = 0.7 + 0.3 * sin(t * (hash3(cell) * 3.0 + 1.0) + hash3(cell + 1.0) * 6.28);
-    let star_col = vec3<f32>(0.88, 0.93, 1.0) * star_val * twinkle;
+    let star_col = vec3<f32>(0.85, 0.95, 1.0) * star_val * twinkle;
 
     // ---- Sun ----
     let sun_col = sun_disc(ray, sky.sun_dir.xyz, t);

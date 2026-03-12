@@ -14,11 +14,13 @@ struct SceneUniforms {
 };
 
 struct Material {
-    albedo    : vec4<f32>,
-    roughness : f32,
-    metallic  : f32,
-    emissive  : f32,
-    is_light  : f32,
+    base_color_factor : vec4<f32>,
+    emissive_factor   : vec3<f32>,
+    roughness_factor  : f32,
+    metallic_factor   : f32,
+    occlusion_factor  : f32,
+    is_light          : f32,
+    _pad              : f32,
 };
 
 struct ObjectUniforms {
@@ -27,27 +29,37 @@ struct ObjectUniforms {
     _pad     : vec4<f32>,
 };
 
-@group(0) @binding(0) var<uniform> scene  : SceneUniforms;
-@group(0) @binding(1) var<uniform> object : ObjectUniforms;
-@group(0) @binding(2) var          t_shadow : texture_depth_2d;
-@group(0) @binding(3) var          s_shadow : sampler_comparison;
+// --- Group 0: Global ---
+@group(0) @binding(0) var<uniform> scene    : SceneUniforms;
+@group(0) @binding(1) var          t_shadow : texture_depth_2d;
+@group(0) @binding(2) var          s_shadow : sampler_comparison;
+
+// --- Group 1: Material ---
+@group(1) @binding(0) var<uniform> object : ObjectUniforms;
+@group(1) @binding(1) var          t_base_color : texture_2d<f32>;
+@group(1) @binding(2) var          s_material   : sampler;
+@group(1) @binding(3) var          t_mr         : texture_2d<f32>;
+@group(1) @binding(4) var          t_normal     : texture_2d<f32>;
+@group(1) @binding(5) var          t_emissive   : texture_2d<f32>;
+@group(1) @binding(6) var          t_occlusion  : texture_2d<f32>;
 
 struct VSOut {
     @builtin(position) clip_pos   : vec4<f32>,
     @location(0)       world_pos  : vec3<f32>,
     @location(1)       normal     : vec3<f32>,
-    @location(2)       tangent    : vec3<f32>,
-    @location(3)       uv         : vec2<f32>,
-    @location(4)       view_dist  : f32,
-    @location(5)       shadow_pos : vec4<f32>,
+    @location(2)       uv         : vec2<f32>,
+    @location(3)       tangent    : vec3<f32>,
+    @location(4)       bitangent  : vec3<f32>,
+    @location(5)       view_dist  : f32,
+    @location(6)       shadow_pos : vec4<f32>,
 };
 
 @vertex
 fn vs_main(
     @location(0) position : vec3<f32>,
     @location(1) normal   : vec3<f32>,
-    @location(2) tangent  : vec3<f32>,
-    @location(3) uv       : vec2<f32>,
+    @location(2) uv       : vec2<f32>,
+    @location(3) tangent  : vec4<f32>,
 ) -> VSOut {
     var out : VSOut;
 
@@ -63,8 +75,15 @@ fn vs_main(
         object.model[1].xyz,
         object.model[2].xyz,
     );
-    out.normal  = normalize(nm * normal);
-    out.tangent = normalize(nm * tangent);
+    
+    let N = normalize(nm * normal);
+    let T = normalize(nm * tangent.xyz);
+    let B = cross(N, T) * tangent.w; 
+    
+    out.normal    = N;
+    out.tangent   = T;
+    out.bitangent = B;
+    
     return out;
 }
 
@@ -243,7 +262,7 @@ fn sun_color(
     V       : vec3<f32>,   // view direction
     t       : f32,
     albedo  : vec3<f32>,
-    emissive: f32,
+    emissive: vec3<f32>,
 ) -> vec3<f32> {
 
     // ---- UV from normal (spherical) ----
@@ -297,41 +316,42 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
 
     let t      = scene.time.x;
     let mat    = object.material;
-    let albedo = mat.albedo.rgb;
-    let rough  = clamp(mat.roughness, 0.04, 1.0);
-    let metal  = clamp(mat.metallic,  0.0,  1.0);
+    
+    // 1. Sample Textures or use factors
+    let base_color_tex = textureSample(t_base_color, s_material, in.uv);
+    let albedo = mat.base_color_factor.rgb * base_color_tex.rgb;
+    
+    let mr_tex = textureSample(t_mr, s_material, in.uv);
+    let roughness = clamp(mat.roughness_factor * mr_tex.g, 0.04, 1.0);
+    let metallic  = clamp(mat.metallic_factor  * mr_tex.b, 0.0, 1.0);
 
-    // ---- Sun / emissive object ----
+    let emissive_tex = textureSample(t_emissive, s_material, in.uv);
+    let emissive = mat.emissive_factor * emissive_tex.rgb;
+
+    // 2. Normal Mapping (Tangent Space)
+    let normal_map = textureSample(t_normal, s_material, in.uv).rgb * 2.0 - 1.0;
+    let TBN = mat3x3<f32>(normalize(in.tangent), normalize(in.bitangent), normalize(in.normal));
+    let N_surface = normalize(TBN * normal_map);
+
+    let V = normalize(scene.camera_pos.xyz - in.world_pos);
+
+    // 3. Emissive / Light source handling
     if mat.is_light > 0.5 {
-        let N   = normalize(in.normal);
-        let V   = normalize(scene.camera_pos.xyz - in.world_pos);
-        let col = sun_color(N, V, t, albedo, mat.emissive);
-        // Apply fog then output HDR (bloom will pick up the bright values)
+        let col = sun_color(N_surface, V, t, albedo, mat.emissive_factor);
         return vec4<f32>(apply_fog_linear(col, in.view_dist), 1.0);
     }
 
-    // ---- Normal PBR ----
-    let raw_N = normalize(in.normal);
-    let T     = normalize(in.tangent);
-    let N     = micro_normal(raw_N, T, in.uv, rough * 0.03);
-    let V     = normalize(scene.camera_pos.xyz - in.world_pos);
-    let NdV   = max(dot(N, V), 0.0001);
+    // 4. Lighting Calculation
+    let NdV = max(dot(N_surface, V), 0.0001);
+    let F0  = mix(vec3<f32>(0.04), albedo, metallic);
 
-    // ---- Shadow ----
-    let L0     = normalize(scene.light_pos[0].xyz - in.world_pos);
-    let NdL0   = max(dot(N, L0), 0.0);
+    var Lo = vec3<f32>(0.0);
+    
+    // Hardcoded simple shadow for the first light
+    let L0   = normalize(scene.light_pos[0].xyz - in.world_pos);
+    let NdL0 = max(dot(N_surface, L0), 0.0);
     let shadow = sample_shadow(in.shadow_pos, NdL0);
 
-    // ---- Surface albedo ----
-    var surface_albedo = albedo;
-    let is_ground      = f32(raw_N.y > 0.95);
-    let check          = checker(in.uv, 4.0);
-    surface_albedo     = mix(surface_albedo, surface_albedo * (0.6 + 0.4 * check), is_ground);
-
-    let F0 = mix(vec3<f32>(0.04), surface_albedo, metal);
-
-    // ---- Light accumulation ----
-    var Lo = vec3<f32>(0.0);
     for (var i = 0u; i < MAX_LIGHTS; i++) {
         let lpos    = scene.light_pos[i].xyz;
         let lcol    = scene.light_color[i].rgb;
@@ -341,25 +361,30 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
         let s = select(1.0, shadow, i == 0u);
 
         Lo += point_light_brdf(
-            N, V, in.world_pos, F0, surface_albedo,
-            rough, metal, lpos, lcol, lintens, s,
+            N_surface, V, in.world_pos, F0, albedo,
+            roughness, metallic, lpos, lcol, lintens, s,
         );
     }
 
-    // ---- Ambient ----
-    let F_amb  = fresnel_schlick_rough(NdV, F0, rough);
-    let kD_amb = (1.0 - F_amb) * (1.0 - metal);
-    let ambient = kD_amb * hemisphere_ambient(N) * surface_albedo
-                * (1.25 + 0.25 * shadow);
-
-    let ao    = 0.7 + 0.3 * NdV;
-    var color = (Lo + ambient) * ao;
-
-    // Subtle chromatic fringe
-    let fringe = pow(1.0 - NdV, 5.0);
-    color.r   += fringe * 0.04;
-    color.b   += fringe * 0.02;
-
+    // 5. Ambient / IBL baseline — Boosted
+    let occlusion = textureSample(t_occlusion, s_material, in.uv).r * object.material.occlusion_factor;
+    
+    // Virtual Hemisphere / Environment term
+    let env_ambient = hemisphere_ambient(N_surface) * albedo * 0.15; // Increased boost
+    let base_ambient = albedo * 0.1;
+    let ambient = (base_ambient + env_ambient) * occlusion;
+    
+    // Cinematic Metallic Sheen (Pseudo-IBL)
+    // Highly reflective metals get a boost in ambient to look "shiny" without real reflections
+    let refl_vec = reflect(-V, N_surface);
+    let view_dot_refl = max(dot(V, refl_vec), 0.0);
+    let metallic_spec = pow(view_dot_refl, 32.0) * metallic * F0 * 0.5;
+    
+    // 6. Combine Lo + Ambient + Boosted Emissive
+    var color = Lo + ambient + metallic_spec + (emissive * 3.5); // Boosted emissive factor
+    
+    // Subtle chromatic fringe/fog
     color = apply_fog_linear(color, in.view_dist);
+    
     return vec4<f32>(color, 1.0);
 }

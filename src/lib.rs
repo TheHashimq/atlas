@@ -4,7 +4,7 @@ mod features;
 
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::Arc;
+use glam::{Vec3, Mat4, EulerRot, Quat};
 
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
@@ -52,14 +52,12 @@ async fn fetch_bytes(url: &str) -> Result<Vec<u8>, JsValue> {
 
 struct VehiclePhysics {
     velocity         : glam::Vec3,
-    angular_velocity : f32,       // rotation around Y axis
-    base_y           : f32,       // target hover height
-    hover_phase      : f32,       // accumulated time for sine bob
-    
-    // Config
+    angular_velocity : f32,       
+    base_y           : f32,       
+    hover_phase      : f32,       
     accel      : f32,
     turn_accel : f32,
-    friction   : f32,     // exponential dampening
+    friction   : f32,     
     ang_frict  : f32,
 }
 
@@ -70,69 +68,44 @@ impl VehiclePhysics {
             angular_velocity: 0.0,
             base_y,
             hover_phase: 0.0,
-            
-            accel: 25.0,        // thrust power
-            turn_accel: 15.0,   // turning torque
-            friction: 4.0,      // slide friction 
-            ang_frict: 8.0,     // rotational friction
+            accel: 25.0,
+            turn_accel: 15.0,
+            friction: 4.0,
+            ang_frict: 8.0,
         }
     }
 
     fn update(&mut self, transform: &mut Transform, keys: &KeyboardState, dt: f32) {
-        // --- 1. Input Forces ---
-        // Forward vector comes from the transform's current rotation
         let forward = transform.rotation.mul_vec3(glam::Vec3::Z);
-        
         let mut thrust = 0.0;
         if keys.w() { thrust += 1.0; }
         if keys.s() { thrust -= 1.0; }
-        
         let mut turn = 0.0;
-        if keys.a() { turn += 1.0; } // Turn left
-        if keys.d() { turn -= 1.0; } // Turn right
+        if keys.a() { turn += 1.0; }
+        if keys.d() { turn -= 1.0; }
 
-        // Apply forces to velocities
         self.velocity += forward * thrust * self.accel * dt;
         self.angular_velocity += turn * self.turn_accel * dt;
 
-        // --- 2. Damping (Friction) ---
-        // Exponential decay: v = v0 * exp(-friction * dt)
         let lin_damp = (-self.friction * dt).exp();
         let ang_damp = (-self.ang_frict * dt).exp();
         self.velocity *= lin_damp;
         self.angular_velocity *= ang_damp;
 
-        // --- 3. Integration ---
         transform.translation += self.velocity * dt;
         transform.rotation *= glam::Quat::from_rotation_y(self.angular_velocity * dt);
 
-        // --- 4. Procedural Hover & Ground Constraint ---
-        // Base translation Y is 0.0, calculate hover over it
-        self.hover_phase += dt * 2.5; // hover frequency
-        
-        // Complex mechanical bob: main sine + subtle high-freq sine + velocity dip
-        let bob = (self.hover_phase.sin() * 0.06) 
-                + ((self.hover_phase * 2.1).sin() * 0.02);
-        
-        // Dip the nose down slightly based on forward velocity
+        self.hover_phase += dt * 2.5;
+        let bob = (self.hover_phase.sin() * 0.06) + ((self.hover_phase * 2.1).sin() * 0.02);
         let speed = self.velocity.dot(forward);
         let pitch_dip = speed * -0.015; 
-        
-        // Dip sideways (roll) based on angular velocity (drifting)
         let roll_dip = self.angular_velocity * -0.05;
 
-        // Apply final procedural height and tilts
         transform.translation.y = self.base_y + bob;
-        
-        // Reconstruct rotation with pitch/roll applied *on top* of the base Y yaw
         let (yaw, _, _) = transform.rotation.to_euler(glam::EulerRot::YXZ);
         transform.rotation = glam::Quat::from_euler(glam::EulerRot::YXZ, yaw, pitch_dip, roll_dip);
     }
 }
-
-// ================================================================
-//  Main Startup
-// ================================================================
 
 #[wasm_bindgen(start)]
 pub fn start() {
@@ -140,26 +113,15 @@ pub fn start() {
     console_log::init_with_level(log::Level::Info).expect("logger");
 
     spawn_local(async move {
+        let win      = window().expect("no window");
+        let document = win.document().expect("no document");
+        let canvas = document.get_element_by_id("gfx").expect("canvas not found").dyn_into::<HtmlCanvasElement>().expect("not a canvas");
 
-        let window   = window().expect("no window");
-        let document = window.document().expect("no document");
-
-        let canvas = document
-            .get_element_by_id("gfx")
-            .expect("canvas not found")
-            .dyn_into::<HtmlCanvasElement>()
-            .expect("not a canvas");
-
-        // ---- GPU ----
         let instance = wgpu::Instance::default();
         let mut surface = GpuSurface::new(&instance, &canvas);
         let gpu = GpuDevice::new(&instance, &surface.surface).await;
 
-        gpu.device.on_uncaptured_error(Arc::new(|error: wgpu::Error| {
-            log::error!("WebGPU device error: {:?}", error);
-        }));
-
-        let dpr = window.device_pixel_ratio();
+        let dpr = win.device_pixel_ratio();
         let mut width  = (canvas.client_width()  as f64 * dpr) as u32;
         let mut height = (canvas.client_height() as f64 * dpr) as u32;
         if width  == 0 { width  = 1; }
@@ -169,238 +131,154 @@ pub fn start() {
         canvas.set_height(height);
         surface.resize(&gpu.adapter, &gpu.device, width, height);
 
-        let surface_format = surface.config.format;
-        log::info!("Initialized WebGPU surface. Format: {:?}", surface_format);
-
-        // 🌟 Enable Full Effects (Balanced Quality)
-        let renderer = Rc::new(RefCell::new(Renderer::new_with_quality(
-            &gpu.device, surface_format, width, height, QualityTier::Balanced
-        )));
+        let renderer = Rc::new(RefCell::new(Renderer::new_with_quality(&gpu.device, &gpu.queue, surface.config.format, width, height, QualityTier::Balanced)));
         renderer.borrow_mut().skip_effects = false;
 
-        // ---- Input State ----
-        let orbit_cam = Rc::new(RefCell::new(OrbitCamera::new(6.0)));
+        let orbit_cam = Rc::new(RefCell::new(OrbitCamera::new(25.0)));
         let sun_ctrl  = Rc::new(RefCell::new(SunController::new()));
         let keys      = Rc::new(RefCell::new(KeyboardState::new()));
-        
         let listeners = attach_input_listeners(&canvas, orbit_cam.clone(), sun_ctrl.clone(), keys.clone());
-        let listeners = Rc::new(listeners); // Keep alive
-        
-        {
-            let mut o = orbit_cam.borrow_mut();
-            o.t_yaw   = 0.4;
-            o.t_pitch = 0.30;
-            o.yaw     = 0.4;
-            o.pitch   = 0.30;
-        }
 
         let camera = Rc::new(RefCell::new(Camera {
-            position : glam::Vec3::new(0.0, 1.5, 5.0),
-            target   : glam::Vec3::ZERO,
-            up       : glam::Vec3::Y,
+            position : Vec3::new(0.0, 3.0, 8.0),
+            target   : Vec3::ZERO,
+            up       : Vec3::Y,
             aspect   : width as f32 / height as f32,
-            fov_y    : 50f32.to_radians(),
+            fov_y    : 45f32.to_radians(),
             near     : 0.1,
-            far      : 100.0,
+            far      : 500.0,
         }));
 
-        // ---- Scene ----
         let mut scene = Scene::new(camera.clone());
 
-        // Dynamic Loading - Check URL for model parameter
-        let location = window.location();
+        // Model loading
+        let location = win.location();
         let search = location.search().unwrap_or_default();
         let mut model_name = "hovercar.glb".to_string();
-        if search.starts_with("?model=") {
-            model_name = search[7..].to_string();
-        }
-
+        if search.starts_with("?model=") { model_name = search[7..].to_string(); }
         let model_url = format!("/models/{}", model_name);
-        log::info!("Fetching model from: {}", model_url);
         
-        let mut model_bytes = Vec::new();
-        match fetch_bytes(&model_url).await {
-            Ok(bytes) => { 
-                log::info!("Successfully fetched {} bytes", bytes.len());
-                model_bytes = bytes; 
-            },
-            Err(e) => { 
-                let err_str = js_sys::JSON::stringify(&e)
-                    .map(|s| String::from(s))
-                    .unwrap_or_else(|_| "Unknown Error".to_string());
-                log::error!("Failed to fetch model {}: {}", model_url, err_str); 
-            }
-        }
-
-        // 1. Vehicle
-        let mut vehicle_physics = VehiclePhysics::new(0.0);
-        let car_transform = Rc::new(RefCell::new(Transform::identity()));
-        
-        if !model_bytes.is_empty() {
-            if let Some(mut hovercar) = crate::runtime::scene_loader::load_gltf_from_bytes(&gpu.device, &model_bytes) {
-                {
-                    let mut t = hovercar.transform.borrow_mut();
-                    t.scale = glam::Vec3::splat(0.5);
-                    t.rotation = glam::Quat::from_rotation_y(20f32.to_radians());
-                    *car_transform.borrow_mut() = *t; // Capture initial
+        if let Ok(model_bytes) = fetch_bytes(&model_url).await {
+            log::info!("Loading model: {}", model_url);
+            let model_objects = crate::runtime::scene_loader::load_gltf_from_bytes(&gpu.device, &gpu.queue, &model_bytes);
+            
+            if !model_objects.is_empty() {
+                // Determine global bounds for all objects to center it
+                let mut global_min = glam::Vec3::splat(f32::MAX);
+                let mut global_max = glam::Vec3::splat(f32::MIN);
+                for obj in &model_objects {
+                    global_min = global_min.min(obj.bounds_min);
+                    global_max = global_max.max(obj.bounds_max);
                 }
-                hovercar.transform = car_transform.clone();
-                scene.objects.push(hovercar);
+
+                let max_dim = (global_max - global_min).max_element().max(0.001);
+                let scale_factor = 10.0 / max_dim;
+                let center = (global_min + global_max) * 0.5;
+
+                for obj in model_objects {
+                    {
+                        let mut t = obj.transform.borrow_mut();
+                        // Combine existing transform (from node hierarchy) with centering/scaling
+                        let m = glam::Mat4::from_scale(Vec3::splat(scale_factor)) * 
+                                glam::Mat4::from_translation(-center) * 
+                                t.matrix();
+                        t.set_from_matrix(m);
+                    }
+                    scene.objects.push(obj);
+                }
             }
         }
 
-        // 2. The Sun (Light + Mesh)
+        // Lighting System
         let sun_t = Rc::new(RefCell::new(Transform::identity()));
-        let distance = 20.0;
-        sun_t.borrow_mut().translation = sun_ctrl.borrow().get_position(distance);
-        sun_t.borrow_mut().scale = glam::Vec3::splat(1.2); // Big sun disc
+        scene.point_lights.push((sun_t.clone(), PointLight { color: [1.0, 0.95, 0.8], intensity: 2.0, is_light: 1.0 }));
 
-        scene.add_point_light(
-            sun_t.clone(),
-            PointLight { color: [1.0, 0.95, 0.9], intensity: 45.0 },
-        );
+        let fill_t = Rc::new(RefCell::new(Transform::identity()));
+        { fill_t.borrow_mut().translation = Vec3::new(-30.0, 15.0, -20.0); }
+        scene.point_lights.push((fill_t, PointLight { color: [0.5, 0.7, 1.0], intensity: 1.5, is_light: 1.0 }));
 
+        let rim_t = Rc::new(RefCell::new(Transform::identity()));
+        { rim_t.borrow_mut().translation = Vec3::new(0.0, -20.0, 30.0); }
+        scene.point_lights.push((rim_t, PointLight { color: [0.3, 0.4, 0.8], intensity: 0.8, is_light: 1.0 }));
+
+        // The Visible Sun Orb
         let sun_mesh = Rc::new(Mesh::sphere(&gpu.device));
         scene.add_object(
-            sun_mesh,
-            sun_t.clone(),
-            Material {
-                albedo: [1.0, 0.8, 0.3, 1.0], // Not really used for emissive
-                roughness: 1.0,
-                metallic: 0.0,
-                emissive: 60.0,   // Drive the HDR bloom VERY high
-                is_light: 1.0,    // Triggers sun_color() in basic.wgsl
-            }
+            sun_mesh, 
+            sun_t.clone(), 
+            Material { 
+                base_color_factor: [1.0, 0.8, 0.3, 1.0], 
+                roughness_factor: 1.0, 
+                metallic_factor: 0.0, 
+                emissive_factor: [80.0, 60.0, 20.0], 
+                occlusion_factor: 1.0,
+                is_light: 1.0, 
+                _pad: [0.0; 1]
+            },
+            None, None, None, None, None, None
         );
 
-        let scene   = Rc::new(RefCell::new(scene));
-        let surface = Rc::new(RefCell::new(surface));
-
-        // ---- Timekeeping ----
-        let performance = window.performance().unwrap();
+        let scene_rc = Rc::new(RefCell::new(scene));
+        let surface_rc = Rc::new(RefCell::new(surface));
+        let performance = win.performance().unwrap();
         let mut last_time = performance.now();
 
-        // ---- RAF Loop ----
         let raf: Rc<RefCell<Option<Closure<dyn FnMut()>>>> = Rc::new(RefCell::new(None));
-        let raf_clone       = raf.clone();
-        let window_for_loop = window.clone();
+        let raf_clone = raf.clone();
+        let raf_win = win.clone();
 
         *raf_clone.borrow_mut() = Some(Closure::wrap(Box::new(move || {
+            let _keep_alive = &listeners; // Capture to prevent dropping
+            let now = performance.now();
+            let dt = ((now - last_time) as f32 / 1000.0).clamp(0.001, 0.05);
+            last_time = now;
 
-            let _keep_alive = &listeners;
+            // Physics Update (Scoped)
+            {
+                let mut orbit = orbit_cam.borrow_mut();
+                let mut k = keys.borrow_mut();
+                orbit.update(dt, &mut k);
 
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-
-                // --- 1. Timing ---
-                let now = performance.now();
-                let dt_ms = (now - last_time) as f32;
-                last_time = now;
-                
-                // Clamp dt between 1ms and 50ms to prevent physics explosions and NaN propagation
-                let mut dt = (dt_ms / 1000.0).clamp(0.001, 0.05);
-                if dt.is_nan() { 
-                    log::warn!("Delta time is NaN! Defaulting to 16ms.");
-                    dt = 0.016; 
-                }
-                
-                if dt_ms > 100.0 {
-                    log::warn!("Significant lag spike detected: {}ms frame time.", dt_ms);
+                let mut scene = scene_rc.borrow_mut();
+                if let Some(car) = scene.objects.get_mut(0) {
+                    let mut t = car.transform.borrow_mut();
+                    t.rotation *= Quat::from_rotation_y(0.15 * dt); // 🚀 SLOW STATION ROTATION
                 }
 
-                // --- 2. Resize check ---
-                {
-                    let canvas_el = window_for_loop
-                        .document().unwrap()
-                        .get_element_by_id("gfx").unwrap()
-                        .dyn_into::<HtmlCanvasElement>().unwrap();
-
-                    let dpr   = window_for_loop.device_pixel_ratio();
-                    let new_w = (canvas_el.client_width()  as f64 * dpr) as u32;
-                    let new_h = (canvas_el.client_height() as f64 * dpr) as u32;
-
-                    let mut surf = surface.borrow_mut();
-                    if new_w != surf.config.width || new_h != surf.config.height {
-                        canvas_el.set_width(new_w);
-                        canvas_el.set_height(new_h);
-                        surf.resize(&gpu.adapter, &gpu.device, new_w, new_h);
-                        renderer.borrow_mut().resize(&gpu.device, new_w, new_h);
-                        camera.borrow_mut().aspect = new_w as f32 / new_h as f32;
-                    }
-                }
-
-                // --- 3. Physics & Controllers ---
-                {
-                    // Update vehicle
-                    let mut ct = car_transform.borrow_mut();
-                    vehicle_physics.update(&mut ct, &keys.borrow(), dt);
-                    
-                    // Smooth tracking - Camera follows vehicle translation gracefully
-                    let mut orbit = orbit_cam.borrow_mut();
-                    let target_cam_pos = ct.translation + glam::Vec3::new(0.0, 1.0, 0.0);
-                    
-                    // Safe exp calculation - bounded by dt clamp but handle NaN just in case
-                    let t = (1.0 - (-8.0_f32 * dt).exp()).clamp(0.0, 1.0);
-                    let cam_target = orbit.target;
-                    orbit.target += (target_cam_pos - cam_target) * t;
-                    
-                    if orbit.target.is_nan() {
-                        orbit.target = glam::Vec3::ZERO;
-                    }
-
-                    // Update camera momentum
-                    orbit.update(dt);
-                    let mut cam = camera.borrow_mut();
-                    orbit.update_camera(&mut cam);
-
-                    // Update sun
-                    let mut sun_c = sun_ctrl.borrow_mut();
-                    sun_c.update(dt);
-                    
-                    // Sun orbits around origin
-                    let mut st = sun_t.borrow_mut();
-                    st.translation = sun_c.get_position(distance);
-                }
-
-                // --- 4. Render ---
-                let surface_ref = surface.borrow_mut();
-                let frame = match surface_ref.surface.get_current_texture() {
-                    Ok(f)  => f,
-                    Err(e) => {
-                        log::warn!("get_current_texture: {:?}", e);
-                        return;
-                    },
-                };
-
-                let view = frame.texture
-                    .create_view(&wgpu::TextureViewDescriptor::default());
-
-                renderer.borrow_mut().render_scene(
-                    &gpu.device,
-                    &gpu.queue,
-                    &view,
-                    &scene.borrow(),
-                );
-
-                frame.present();
-
-            }));
-
-            if let Err(e) = result {
-                log::error!("RAF panic: {:?}", e);
+                let mut cam = camera.borrow_mut();
+                cam.target = orbit.target;
+                cam.position = orbit.get_position();
             }
 
-            window_for_loop
-                .request_animation_frame(
-                    raf.borrow().as_ref().unwrap().as_ref().unchecked_ref(),
-                )
-                .unwrap();
+            // Animation Update (Sun)
+            {
+                let mut sun_c = sun_ctrl.borrow_mut();
+                sun_c.update(dt);
+                sun_t.borrow_mut().translation = sun_c.get_position(60.0);
+            }
 
+            // Render Pass
+            let surf = surface_rc.borrow();
+            if let Ok(frame) = surf.surface.get_current_texture() {
+                let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
+                
+                let vp = {
+                    let orbit = orbit_cam.borrow();
+                    let cam = camera.borrow();
+                    let mut m = cam.projection() * cam.view();
+                    let tilt_x = orbit.last_mouse_norm.y * 0.04;
+                    let tilt_y = -orbit.last_mouse_norm.x * 0.04;
+                    m *= Mat4::from_euler(EulerRot::XYZ, tilt_x, tilt_y, 0.0);
+                    m
+                };
+
+                renderer.borrow_mut().render_scene(&gpu.device, &gpu.queue, &view, &scene_rc.borrow(), Some(vp));
+                frame.present();
+            }
+
+            raf_win.request_animation_frame(raf.borrow().as_ref().unwrap().as_ref().unchecked_ref()).unwrap();
         }) as Box<dyn FnMut()>));
 
-        window
-            .request_animation_frame(
-                raf_clone.borrow().as_ref().unwrap().as_ref().unchecked_ref(),
-            )
-            .unwrap();
+        win.request_animation_frame(raf_clone.borrow().as_ref().unwrap().as_ref().unchecked_ref()).unwrap();
     });
 }

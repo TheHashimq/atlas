@@ -60,10 +60,15 @@ fn srgb_gamma(c: vec3<f32>) -> vec3<f32> {
 fn fs_blit(in: VSOut) -> @location(0) vec4<f32> {
     let uv      = in.uv;
     let hdr     = textureSample(t_src, s_src, uv).rgb;
-    let exposed = hdr * 1.6;
-    let mapped  = aces(exposed);
-    let gamma   = srgb_gamma(mapped);
-    return vec4<f32>(gamma, 1.0);
+    let exposed = hdr * 1.5;
+    
+    // Reinhard Tonemapping
+    var color   = exposed / (exposed + vec3<f32>(1.0));
+    
+    // Gamma Correction
+    color = pow(color, vec3<f32>(1.0 / 2.2));
+    
+    return vec4<f32>(color, 1.0);
 }
 
 // ================================================================
@@ -76,8 +81,8 @@ fn fs_threshold(in: VSOut) -> @location(0) vec4<f32> {
     let col = textureSample(t_src, s_src, uv).rgb;
 
     let lum       = dot(col, vec3<f32>(0.2126, 0.7152, 0.0722));
-    let threshold = 1.1;
-    let knee      = 0.4;
+    let threshold = 1.0; // 🌟 Threshold lowered to 1.0 as requested
+    let knee      = 0.1;
 
     let rq     = clamp(lum - threshold + knee, 0.0, 2.0 * knee);
     let weight = (rq * rq) / (4.0 * knee + 0.00001);
@@ -145,7 +150,7 @@ fn fs_blur_v(in: VSOut) -> @location(0) vec4<f32> {
 }
 
 // ================================================================
-//  fs_composite — Tonemapped Bloom Additive
+//  fs_composite — Bloom Additive
 // ================================================================
 
 @fragment
@@ -153,9 +158,16 @@ fn fs_composite(in: VSOut) -> @location(0) vec4<f32> {
     let uv    = in.uv;
     let bloom = textureSample(t_src, s_src, uv).rgb;
 
-    // Soft filmic bloom
-    let mapped = aces(bloom * 0.20);
-    let gamma  = srgb_gamma(mapped);
+    // Stronger cinematic bloom
+    var color = bloom * 0.8; 
+    
+    // Apply tonemap + gamma to bloom before additive blending if it helps consistency,
+    // or just let it blend linear (which is physically more accurate but can be 'hot').
+    // Since our output is already tonemapped, adding LDR bloom might be weird.
+    // Actually, execute() adds this to the already tonemapped swapchain.
+    
+    color = color / (color + vec3<f32>(1.0));
+    color = pow(color, vec3<f32>(1.0 / 2.2));
 
-    return vec4<f32>(gamma, 1.0);
+    return vec4<f32>(color, 1.0);
 }
